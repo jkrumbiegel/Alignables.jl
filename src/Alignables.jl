@@ -2,6 +2,9 @@ module Alignables
 
 using Rhea
 using Printf
+using DataStructures
+
+export Alignable, Rect, VarRect, FloatRect, Span, SpannedAlignable, Grid, height, width, sides, Axis, constraints
 
 abstract type Alignable end
 
@@ -18,7 +21,7 @@ const VarRect = Rect{FVariable}
 VarRect() = Rect((Variable(0.0) for i in 1:4)...)
 
 const FloatRect = Rect{Float64}
-Base.convert(FloatRect, r::VarRect) = begin
+Base.convert(::Type{FloatRect}, r::VarRect) = begin
     FloatRect(value(r.left), value(r.right), value(r.top), value(r.bottom))
 end
 
@@ -61,7 +64,8 @@ struct Grid <: Alignable
     c_margins::Rect{Constraint}
 end
 
-function Grid(nrows, ncols;
+function Grid(
+        nrows, ncols;
         relwidths = nothing,
         relheights = nothing,
         colspacing = 0.0,
@@ -72,29 +76,29 @@ function Grid(nrows, ncols;
     var_rowspacing = FVariable(0.0)
     marginvars = VarRect()
     Grid(
-        SpannedAlignable[],
-        VarRect(),
-        VarRect(),
-        nrows,
-        ncols,
-        isnothing(relwidths) ? ones(ncols) : convert(Vector{Float64}, relwidths),
-        isnothing(relheights) ? ones(nrows) : convert(Vector{Float64}, relheights),
-        [FVariable(0) for i in 1:nrows],
-        [FVariable(0) for i in 1:nrows],
-        [FVariable(0) for i in 1:nrows-1],
-        [FVariable(0) for i in 1:ncols],
-        [FVariable(0) for i in 1:ncols],
-        [FVariable(0) for i in 1:ncols-1],
-        FVariable(0),
-        FVariable(0),
-        FVariable(0),
-        FVariable(0),
-        var_colspacing,
-        var_rowspacing,
-        var_colspacing == colspacing,
-        var_rowspacing == rowspacing,
-        marginvars,
-        Rect(
+        SpannedAlignable[], # content
+        VarRect(), # edges
+        VarRect(), # aligns
+        nrows, # nrows
+        ncols, # ncols
+        isnothing(relwidths) ? ones(ncols) : convert(Vector{Float64}, relwidths), # relwidths
+        isnothing(relheights) ? ones(nrows) : convert(Vector{Float64}, relheights), # relheights
+        [FVariable(0) for i in 1:nrows], # rowtops
+        [FVariable(0) for i in 1:nrows], # rowbottoms
+        [FVariable(0) for i in 1:nrows-1], # rowgapseps
+        [FVariable(0) for i in 1:ncols], # collefts
+        [FVariable(0) for i in 1:ncols], # colrights
+        [FVariable(0) for i in 1:ncols-1], # colgapseps
+        FVariable(0), # unitwidth
+        FVariable(0), # unitheight
+        FVariable(0), # colgap
+        FVariable(0), # rowgap
+        var_colspacing, # colspacing
+        var_rowspacing, # rowspacing
+        var_colspacing == colspacing, # c_colspacing
+        var_rowspacing == rowspacing, # c_rowspacing
+        marginvars, # margins
+        Rect( # c_margins
             marginvars.left == margins.left,
             marginvars.right == margins.right,
             marginvars.top == margins.top,
@@ -110,53 +114,60 @@ Calculates the constraints for one SpannedAlignable that is placed within
 function constraints_in(g::Grid, spanned::SpannedAlignable)
     al = spanned.al
     sp = spanned.sp
-    constraints = [
+
+    c = OrderedDict{Symbol, Constraint}()
+
         # snap aligns to the correct row and column boundaries
-        al.aligns.top == g.rowtops[sp.rows.start],
-        al.aligns.bottom == g.rowbottoms[sp.rows.stop],
-        al.aligns.left == g.collefts[sp.cols.start],
-        al.aligns.right == g.colrights[sp.cols.stop],
+    c[:snaptop] = al.aligns.top == g.rowtops[sp.rows.start]
+    c[:snapbottom] = al.aligns.bottom == g.rowbottoms[sp.rows.stop]
+    c[:snapleft] = al.aligns.left == g.collefts[sp.cols.start]
+    c[:snapright] = al.aligns.right == g.colrights[sp.cols.stop]
 
         # ensure that grid edges always include the alignable's edges
-        g.edges.right >= al.edges.right + g.margins.right,
-        g.edges.left + g.margins.left <= al.edges.left,
-        g.edges.top >= al.edges.top + g.margins.top,
-        g.edges.bottom + g.margins.bottom <= al.edges.bottom
-    ]
+    c[:incright] = g.edges.right >= al.edges.right + g.margins.right
+    c[:incleft] = g.edges.left + g.margins.left <= al.edges.left
+    c[:inctop] = g.edges.top >= al.edges.top + g.margins.top
+    c[:incbottom] = g.edges.bottom + g.margins.bottom <= al.edges.bottom
 
     # make alignable edges push against the separators inside rows and columns
     # that allow them to grow
     # here the column and row spacing is applied as well
     if sp.cols.start > 1 # only when there's a gap left of the alignable
-        push!(constraints, g.colgapseps[sp.cols.start - 1] <= al.edges.left - 0.5 * g.colspacing)
+        c[:colgapsepleft] = g.colgapseps[sp.cols.start - 1] <= al.edges.left - 0.5 * g.colspacing
     end
     if sp.cols.stop < g.ncols  # only when there's a gap right of the alignable
-        push!(constraints, g.colgapseps[sp.cols.stop] >= al.edges.right + 0.5 * g.colspacing)
+        c[:colgapsepright] = g.colgapseps[sp.cols.stop] >= al.edges.right + 0.5 * g.colspacing
     end
     if sp.rows.start > 1 # only when there's a gap above the alignable
-        push!(constraints, g.rowgapseps[sp.rows.start - 1] >= al.edges.top + 0.5 * g.rowspacing)
+        c[:rowgapseptop] = g.rowgapseps[sp.rows.start - 1] >= al.edges.top + 0.5 * g.rowspacing
     end
     if sp.rows.stop < g.nrows # only when there's a gap below the alignable
-        push!(constraints, g.rowgapseps[sp.rows.stop] <= al.edges.bottom - 0.5 * g.rowspacing)
+        c[:rowgapsepbottom] = g.rowgapseps[sp.rows.stop] <= al.edges.bottom - 0.5 * g.rowspacing
     end
 
-    constraints
+    c
 end
 
-function constraints(g::Grid)::Vector{Constraint}
+function rows(g::Grid)
+    [VarRect(g.aligns.left, g.aligns.right, g.rowtops[i], g.rowbottoms[i]) for i in 1:g.nrows]
+end
 
-    contentconstraints = Constraint[]
+function cols(g::Grid)
+    [VarRect(g.collefts[i], g.colrights[i], g.aligns.top, g.aligns.bottom) for i in 1:g.ncols]
+end
 
-    # all the constraints of alignables the grid contains
-    for spanned in g.content
-        # constraints of alignable in the grid
-        append!(contentconstraints, constraints_in(g, spanned))
-        # constraints of the alignable itself
-        append!(contentconstraints, constraints(spanned.al))
-    end
+function constraints(g::Grid)
 
-    relwidths = [g.rowtops[i] - g.rowbottoms[i] == g.relheights[i] * g.unitheight for i in 1:g.nrows]
-    relheights = [g.colrights[i] - g.collefts[i] == g.relwidths[i] * g.unitwidth for i in 1:g.ncols]
+    rs = rows(g)
+    cs = cols(g)
+
+    relheights = [height(r) == g.relheights[i] * g.unitheight for (i, r) in enumerate(rs)]
+    relwidths = [width(c) == g.relwidths[i] * g.unitwidth for (i, c) in enumerate(cs)]
+
+    # these take care of the column and row order because they have to be ordered
+    # correctly to have a positive width
+    positive_unitheight = g.unitheight >= 0
+    positive_unitwidth = g.unitwidth >= 0
 
     # align first and last row / column with grid aligns
     boundsalign = [
@@ -173,83 +184,141 @@ function constraints(g::Grid)::Vector{Constraint}
         g.edges.left + g.margins.left <= g.aligns.left,
         g.edges.right >= g.aligns.right + g.margins.right,
         # make the aligns go as far to the edges as possible / span out the grid cells
-        (g.edges.top == g.aligns.top) | strong(),
-        (g.edges.bottom == g.aligns.bottom) | strong(),
-        (g.edges.left == g.aligns.left) | strong(),
-        (g.edges.right == g.aligns.right) | strong(),
+        (g.edges.top == g.aligns.top + g.margins.top) | strong(),
+        (g.edges.bottom + g.margins.bottom == g.aligns.bottom) | strong(),
+        (g.edges.left + g.margins.left == g.aligns.left) | strong(),
+        (g.edges.right == g.aligns.right + g.margins.right) | strong(),
     ]
 
     equalcolgaps = g.ncols <= 1 ? [] : [g.collefts[i+1] - g.colrights[i] == g.colgap for i in 1:g.ncols-1]
     equalrowgaps = g.nrows <= 1 ? [] : [g.rowbottoms[i] - g.rowtops[i+1] == g.rowgap for i in 1:g.nrows-1]
 
+    positive_colgap = g.colgap >= 0
+    positive_rowgap = g.rowgap >= 0
+
+    small_colgap = (g.colgap == 0) | strong()
+    small_rowgap = (g.rowgap == 0) | strong()
+
     # the separators have to be between their associated rows / columns
     # but only if there are more than 1 row / column respectively
-    colleftseporder = g.ncols <= 1 ? [] : [g.collefts[i+1] >= g.colgapseps[i] for i in 1:g.ncols-1]
-    colrightseporder = g.ncols <= 1 ? [] : [g.colrights[i] <= g.colgapseps[i] for i in 1:g.ncols-1]
-    rowtopseporder = g.nrows <= 1 ? [] : [g.rowtops[i+1] <= g.rowgapseps[i] for i in 1:g.nrows-1]
-    rowbottomseporder = g.nrows <= 1 ? [] : [g.rowbottoms[i] >= g.rowgapseps[i] for i in 1:g.nrows-1]
+    # colleftseporder = g.ncols <= 1 ? [] : [g.collefts[i+1] >= g.colgapseps[i] for i in 1:g.ncols-1]
+    # colrightseporder = g.ncols <= 1 ? [] : [g.colrights[i] <= g.colgapseps[i] for i in 1:g.ncols-1]
+    # rowtopseporder = g.nrows <= 1 ? [] : [g.rowtops[i+1] <= g.rowgapseps[i] for i in 1:g.nrows-1]
+    # rowbottomseporder = g.nrows <= 1 ? [] : [g.rowbottoms[i] >= g.rowgapseps[i] for i in 1:g.nrows-1]
 
-    # order of columns and rows, otherwise this happens:
-    # Columns:
-    # 24.85 - -202.31
-    #   | 444.01
-    # 479.17 - 24.85
-    #   | 706.33
-    # 706.33 - 479.17
-    colorder = [g.collefts[i] <= g.colrights[i] for i in 1:g.ncols]
-    roworder = [g.rowtops[i] >= g.rowbottoms[i] for i in 1:g.nrows]
 
-    vcat(
-        #try these out against collapsing rows and columns
-        (g.rowgap == 0) | strong(),
-        (g.colgap == 0) | strong(),
-        g.c_colspacing,
-        g.c_rowspacing,
-        g.c_margins.left,
-        g.c_margins.right,
-        g.c_margins.top,
-        g.c_margins.bottom,
-        boundsalign,
-        aligns_to_edges,
-        relwidths,
-        relheights,
-        equalcolgaps,
-        equalrowgaps,
-        colleftseporder,
-        colrightseporder,
-        rowtopseporder,
-        rowbottomseporder,
-        colorder,
-        roworder,
+    contentconstraints = OrderedDict{Symbol, Union{Constraint, Vector{Constraint}, OrderedDict}}()
+    # all the constraints of alignables the grid contains
+    for (i, spanned) in enumerate(g.content)
+        # constraints of the alignable itself
+        contentconstraints[Symbol("$i-al")] = constraints(spanned.al)
+        # append!(contentconstraints, constraints(spanned.al))
+        # constraints of alignable in the grid
+        contentconstraints[Symbol("$i-ingr")] = constraints_in(g, spanned)
+        # append!(contentconstraints, constraints_in(g, spanned))
+    end
 
-        contentconstraints
-    )
+    c = OrderedDict{Symbol, Union{Constraint, Vector{Constraint}, OrderedDict}}()
+
+    c[:positive_unitheight] = positive_unitheight
+    c[:positive_unitwidth] = positive_unitwidth
+    c[:positive_colgap] = positive_colgap
+    c[:positive_rowgap] = positive_rowgap
+    c[:small_colgap] = small_colgap
+    c[:small_rowgap] = small_rowgap
+    c[:boundsalign] = boundsalign
+    c[:relwidths] = relwidths
+    c[:relheights] = relheights
+    c[:c_colspacing] = g.c_colspacing
+    c[:c_rowspacing] = g.c_rowspacing
+    c[:c_margins_left] = g.c_margins.left
+    c[:c_margins_right] = g.c_margins.right
+    c[:c_margins_top] = g.c_margins.top
+    c[:c_margins_bottom] = g.c_margins.bottom
+    c[:aligns_to_edges] = aligns_to_edges
+    c[:equalcolgaps] = equalcolgaps
+    c[:equalrowgaps] = equalrowgaps
+    c[:contentconstraints] = contentconstraints
+
+    # #TODO put constraints in ordered dict to know which fail
+    # vcat(
+    #     positive_unitheight,
+    #     positive_unitwidth,
+    #     positive_colgap,
+    #     positive_rowgap,
+    #     small_colgap,
+    #     small_rowgap,
+    #     boundsalign,
+    #     relwidths,
+    #     relheights,
+    #     g.c_colspacing,
+    #     g.c_rowspacing,
+    #     g.c_margins.left,
+    #     g.c_margins.right,
+    #     g.c_margins.top,
+    #     g.c_margins.bottom,
+    #     aligns_to_edges,
+    #     equalcolgaps,
+    #     equalrowgaps,
+    #
+    #     contentconstraints
+    # )
+    c
 end
 
 width(a::Alignable) = width(a.edges)
 height(a::Alignable) = height(a.edges)
 
-struct MyAxis <: Alignable
+struct Axis <: Alignable
     edges::VarRect
     aligns::VarRect
-    labelsizes::Rect{Float64}
+    constraints::OrderedDict{Symbol, Constraint}
 end
 
-constraints(a::MyAxis) = begin
-    edgesaligns = [
-        a.edges.top == a.aligns.top + a.labelsizes.top,
-        a.edges.bottom == a.aligns.bottom - a.labelsizes.bottom,
-        a.edges.left == a.aligns.left - a.labelsizes.left,
-        a.edges.right == a.aligns.right + a.labelsizes.right,
-        # try adding these
-        a.edges.top >= a.edges.bottom,
-        a.edges.right >= a.edges.left,
-        a.aligns.top >= a.aligns.bottom,
-        a.aligns.right >= a.aligns.left
-    ]
+function Axis(left::Real, right::Real, top::Real, bottom::Real)
+    edges = VarRect()
+    aligns = VarRect()
+
+    left_var = FVariable()
+    right_var = FVariable()
+    top_var = FVariable()
+    bottom_var = FVariable()
+
+    constraints = OrderedDict{Symbol, Constraint}()
+
+    # make constraints from the variables with which their values can be set later
+    constraints[:left] = left_var == left
+    constraints[:right] = right_var == right
+    constraints[:top] = top_var == top
+    constraints[:bottom] = bottom_var == bottom
+
+    constraints[:top_align] = (edges.top == aligns.top + top_var)# | strong()
+    constraints[:left_align] = (edges.left == aligns.left - left_var)# | strong()
+    constraints[:right_align] = (edges.right == aligns.right + right_var)# | strong()
+    constraints[:bottom_align] = (edges.bottom == aligns.bottom - bottom_var)# | strong()
+
+    constraints[:width_positive] = width(aligns) >= 0
+    constraints[:height_positive] = height(aligns) >= 0
+
+    Axis(edges, aligns, constraints)
 end
 
-MyAxis() = MyAxis(VarRect(), VarRect(), Rect((20 .+ rand(4) * 20)...))
+constraints(a::Axis) = begin
+    [c for c in values(a.constraints)]
+end
+# constraints(a::Axis) = begin
+#     edgesaligns = [
+#         (a.edges.top == a.aligns.top + a.labelsizes.top) | strong(),
+#         (a.edges.bottom == a.aligns.bottom - a.labelsizes.bottom) | strong(),
+#         (a.edges.left == a.aligns.left - a.labelsizes.left) | strong(),
+#         (a.edges.right == a.aligns.right + a.labelsizes.right) | strong(),
+#
+#         width(a) >= 0,
+#         height(a) >= 0
+#     ]
+# end
+
+# Axis() = Axis(VarRect(), VarRect(), Rect((20 .+ rand(4) * 20)...))
 
 Rhea.add_constraints(s::SimplexSolver, a::Alignable) = add_constraints(s, constraints(a))
 
@@ -326,21 +395,21 @@ function Base.show(io::IO, g::Grid)
     println("Rows:")
     for i in 1:g.nrows
         if i > 1
-            @printf("  gap %.2f | sep %.2f\n", value(g.rowbottoms[i-1]) - value(g.rowtops[i]), value(g.rowgapseps[i-1]))
+            @printf("  gap height %.2f with separator at %.2f\n", value(g.rowbottoms[i-1]) - value(g.rowtops[i]), value(g.rowgapseps[i-1]))
         end
-        @printf("%.2f - %.2f | %.2f\n", value(g.rowtops[i]), value(g.rowbottoms[i]), value(g.rowtops[i]) - value(g.rowbottoms[i]))
+        @printf("%d from %.2f to %.2f with height %.2f\n", i, value(g.rowtops[i]), value(g.rowbottoms[i]), value(g.rowtops[i]) - value(g.rowbottoms[i]))
     end
     println("Columns:")
     for i in 1:g.ncols
         if i > 1
-            @printf("  gap %.2f | sep %.2f\n", value(g.collefts[i]) - value(g.colrights[i-1]),  value(g.colgapseps[i-1]))
+            @printf("  gap width %.2f with separator at %.2f\n", value(g.collefts[i]) - value(g.colrights[i-1]),  value(g.colgapseps[i-1]))
         end
-        @printf("%.2f - %.2f | %.2f\n", value(g.collefts[i]), value(g.colrights[i]), value(g.colrights[i]) - value(g.collefts[i]))
+        @printf("%d from %.2f to %.2f with width %.2f\n", i, value(g.collefts[i]), value(g.colrights[i]), value(g.colrights[i]) - value(g.collefts[i]))
     end
 end
 
-function Base.show(io::IO, a::MyAxis)
-    println("MyAxis")
+function Base.show(io::IO, a::Axis)
+    println("Axis")
     print(io, "Edges: ")
     println(io, a.edges)
     print(io, "Aligns: ")
@@ -354,7 +423,9 @@ function rectlines(l, r, t, b)
 end
 
 function observables(r::VarRect)
-    (r.left.p, r.right.p, r.top.p, r.bottom.p)
+    (r.left.obs, r.right.obs, r.top.obs, r.bottom.obs)
 end
+
+include("plot.jl")
 
 end # module
